@@ -21,6 +21,10 @@ static int read_sample_8(FILE* fhandle);
 //
 //---------------------------------------------------------------------------------------------
 //
+static int read_sample_1(FILE* fhandle);
+//
+//---------------------------------------------------------------------------------------------
+//
 static int read_sample_ascii(FILE* fhandle);
 //
 //---------------------------------------------------------------------------------------------
@@ -30,6 +34,10 @@ static int write_sample_16(int c, FILE* fhandle);
 //---------------------------------------------------------------------------------------------
 //
 static int write_sample_8(int c, FILE* fhandle);
+//
+//---------------------------------------------------------------------------------------------
+//
+static int write_sample_1(int c, FILE* fhandle);
 //
 //---------------------------------------------------------------------------------------------
 //
@@ -71,10 +79,14 @@ image_info_t read_pnm_info(FILE* fhandle) {
   info.type = fgetc(fhandle)-'0';
   switch (info.type) {
     case 1:
+    info.channels = 1;
+    info.encoding = PNM_ASCII;
+    break;
+
     case 4:
-    fprintf(stderr,"ERROR: bilevel PNM types (1,4) not supprted.\n");
-    info.result = RESULT_ERROR;
-    return info;
+    info.channels = 1;
+    info.encoding = PNM_BINARY;
+    break;
 
     case 2: // ASCII PGM
     info.channels = 1;
@@ -117,10 +129,15 @@ image_info_t read_pnm_info(FILE* fhandle) {
     info.result = RESULT_ERROR;
     return info;
   }
-  if ((res = fscanf(fhandle, " %d ", &info.maxval)) <= 0) {
-    fprintf(stderr,"pnm: error reading maxval.\n");
-    info.result = RESULT_ERROR;
-    return info;
+  if ((info.type != 1) && (info.type != 4)) {
+    if ((res = fscanf(fhandle, " %d ", &info.maxval)) <= 0) {
+      fprintf(stderr,"pnm: error reading maxval.\n");
+      info.result = RESULT_ERROR;
+      return info;
+    }
+    info.depth = info.maxval < 256 ? 8: 16;
+  } else {
+    info.depth = 1;
   }
   // read trailing newline
   int c;
@@ -131,7 +148,6 @@ image_info_t read_pnm_info(FILE* fhandle) {
   //
   // additional data derived from the other fields
   //
-  info.depth = info.maxval < 256 ? 8: 16;
   return info;  
 }
 
@@ -143,7 +159,9 @@ int write_pnm_info(const image_info_t* info, FILE* fhandle) {
   rewind(fhandle);
   fprintf(fhandle, "P%c\n", info->type + '0'); 
   fprintf(fhandle, "%d %d\n", info->width, info->height);
-  fprintf(fhandle, "%d\n", info->maxval);
+  if ((info->type != 1)  && (info->type != 4)) {
+    fprintf(fhandle, "%d\n", info->maxval);
+  }
   return ferror(fhandle) ? RESULT_ERROR : RESULT_OK;
 }
 //
@@ -205,17 +223,7 @@ int read_pixels(FILE* fhandle, const int depth, const int channels, const int en
     }
     return RESULT_OK;
 
-  } else if (depth <= 8) { // 1-8
-
-    for (int i = 0; i < nsamples; i++) {
-      if ( (pixels[i] = read_sample_8(fhandle)) == RESULT_ERROR ) {
-        fclose(fhandle);
-        return RESULT_ERROR;
-      }
-    }
-    return RESULT_OK;
-
-  } else { // 9-16 bits: 2 bytes per sample    
+  } else if (depth > 8) { // 9-16 bits: 2 bytes per sample    
 
     for (int i = 0; i < nsamples; i++) {
       if ( (pixels[i] = read_sample_16(fhandle)) == RESULT_ERROR ) {
@@ -224,6 +232,26 @@ int read_pixels(FILE* fhandle, const int depth, const int channels, const int en
       }
     }
     return RESULT_OK;
+
+  } else if (depth > 1) { // 2-8
+
+    for (int i = 0; i < nsamples; i++) {
+      if ( (pixels[i] = read_sample_8(fhandle)) == RESULT_ERROR ) {
+        fclose(fhandle);
+        return RESULT_ERROR;
+      }
+    }
+    return RESULT_OK;
+  } else { // 1 bit binary
+    read_sample_1(NULL); // reset bit buffer!
+
+    for (int i = 0; i < nsamples; i++) {
+      if ( (pixels[i] = read_sample_1(fhandle)) == RESULT_ERROR ) {
+        fclose(fhandle);
+        return RESULT_ERROR;
+      }
+    }
+
   }
 }
 //
@@ -254,7 +282,17 @@ int write_pixels(const int depth, const int channels, const int encoding, const 
     }
     return RESULT_OK;
 
-  } else if (depth <= 8) { // 1-8
+  } else if (depth > 8) { // 9-16 bits: 2 bytes per sample    
+
+    for (int i = 0; i < nsamples; i++) {
+      if ( write_sample_16(pixels[i],fhandle) == RESULT_ERROR ) {
+        fclose(fhandle);
+        return RESULT_ERROR;
+      }
+    }
+    return RESULT_OK;
+
+  } else if (depth > 1) { // 2-8
 
     for (int i = 0; i < nsamples; i++) {
       if ( write_sample_8(pixels[i],fhandle) == RESULT_ERROR ) {
@@ -264,10 +302,10 @@ int write_pixels(const int depth, const int channels, const int encoding, const 
     }
     return RESULT_OK;
 
-  } else { // 9-16 bits: 2 bytes per sample    
-
+  } else {
+    write_sample_1(0,NULL); // reset bit buffer!
     for (int i = 0; i < nsamples; i++) {
-      if ( write_sample_16(pixels[i],fhandle) == RESULT_ERROR ) {
+      if ( write_sample_1(pixels[i],fhandle) == RESULT_ERROR ) {
         fclose(fhandle);
         return RESULT_ERROR;
       }
@@ -326,6 +364,29 @@ static int read_sample_8(FILE* fhandle) {
 //
 //---------------------------------------------------------------------------------------------
 //
+static int read_sample_1(FILE* fhandle) { // NOT REENTRANT!
+  static unsigned char buffer = 0x00;
+  static unsigned char mask  = 0x00;
+  int res;
+  unsigned char val;
+  if (fhandle == NULL) { // reset buffer 
+    buffer = 0x00;
+    mask = 0x00;
+    return 0;
+  }
+  if (mask == 0) {
+    res = fread(&buffer,1,1,fhandle);
+    if (res != 1) return RESULT_ERROR;
+    mask = 0x80;
+  }
+  val = (buffer & mask) ? 1 : 0;
+  mask >>= 1; // shift one bit to right
+  printf("mask %d buffer %d val %d\n",mask,buffer,val);
+  return val;
+}
+//
+//---------------------------------------------------------------------------------------------
+//
 static int read_sample_ascii(FILE* fhandle) {
   int val;
   int res;
@@ -348,6 +409,36 @@ static int write_sample_16(int c, FILE* fhandle) {
 //
 static int write_sample_8(int c, FILE* fhandle) {
   return fputc(c,fhandle) == EOF ? RESULT_ERROR: RESULT_OK;
+}
+//
+//---------------------------------------------------------------------------------------------
+//
+static int write_sample_1(int v, FILE* fhandle) { // NOT REENTRANT
+  static unsigned char buffer = 0x00;
+  static unsigned char mask  = 0x80;
+  int res;
+  unsigned char val;
+  if (fhandle == NULL) { // reset buffer 
+    buffer = 0x00;
+    mask = 0x80;
+    return 0;
+  }
+  printf("write: buffer %d mask %d val %d\n",buffer,mask,v);
+  if (v) { 
+    buffer |= mask; 
+  }
+  mask >>= 1;
+  if (mask == 0) { // set up for new pack of 8 bits
+    if ((res = fputc(buffer,fhandle)) == EOF) {
+      return RESULT_ERROR;
+    }
+    mask = 0x80;
+    buffer = 0x00;
+    return RESULT_OK;    
+  }
+  else {
+    return RESULT_OK;
+  }
 }
 //
 //---------------------------------------------------------------------------------------------
